@@ -1,6 +1,7 @@
 #include "Filter.h"
 
 uint16_t n1000Sound[11] = {175,196,220,233,262,294,330,349,392,400,1000};
+uint16_t r160Sound[5] = {380,665,1290,1430,1245};
 
 // Auto generated sine LUT from SinCosLUTGenerator.m, credit: Alec Marshall 
 uint8_t sinTable[360] = {
@@ -74,31 +75,41 @@ uint16_t map_uint16(uint16_t x, uint16_t in_min, uint16_t in_max, uint16_t out_m
 // Analog input to adjust frequency
 #define FREQKNOB A0
 
+// Gate enable pin
+#define GATEENPIN 22
+
+// Default Carrier Freq
+#define DEFCARRIER 1000
+
 // Deadtime in nanoseconds between switching high and low to prevent transistor shoothrough
 // Minimum value is 100
 long deadTimeNanos = 1000;
 
 // Deadtime in timer counts (calculated in setCarrierFrequency function)
-uint16_t deadTimeCycles;
+uint16_t deadTimeCycles = (deadTimeNanos<100 ? 100:deadTimeNanos)*(16.0/1000.0);
 
 // Used for calculations of wave position (wavetable length)
 uint16_t nSine = sizeof(sinTable)/sizeof(sinTable[0]);
 
 // Default motor drive parameters
-float carrierFreq = 1000; // Switching frequency (hz)
-float driveFreq = 1; // Drive (hz)
+float driveFreq = 10; // Drive (hz)
 float prevDriveFreq = driveFreq;
-float dutyCycle = 100; // (%) of max (used for voltage conversion)
-bool onePhase = true;
+float vfRatio = 230.0/60.0;
+float vRMS_DCBUS = 60/sqrt(2);
+float dutyCycle = (vfRatio*driveFreq/vRMS_DCBUS)*100; // (%) of max (used for voltage conversion)
+bool onePhase = false; // Switches drive between 1 and 3 phase operation
+bool dir3Ph = false; // Reverses drive output
 
 // Calculate number of required ISR cycles to produce 1 period of wave
-volatile uint16_t nISR = carrierFreq/driveFreq;
+volatile uint16_t nISR;
 // Calculate sine table step size
-volatile float sineStep = ((float)nSine/(float)nISR);
+volatile float sineStep;
 // Scaling factor for sine table
-volatile float scaleFactor = 1;
+volatile float scaleFactor;
 // Index variable for ISR
 volatile uint16_t sineIndex = 0;
+// Initialize U Phase table LUT index
+volatile uint16_t uPhaseTableIndex = 0;
 
 // Serial buffer size
 const byte numChars = 32;
@@ -128,7 +139,7 @@ void setup() {
   // Sets up output and input pin configs
   setupPins();
   // Sets up timers with default carrier frequency and outputs disabled
-  setupTimers(carrierFreq);
+  setupTimers(DEFCARRIER);
 }
 
 void loop() {
@@ -143,6 +154,27 @@ void loop() {
       stopPWM();
     }
   }
+  else if (strcmp("d", commandFromSerial) == 0){
+    if(integerFromSerial >= 1){
+      dir3Ph = true;
+    }
+    else{
+      dir3Ph = false;
+    }
+  }
+  else if (strcmp("v", commandFromSerial) == 0){
+    if(floatFromSerial >= 0.01 && floatFromSerial <= 100){
+      dutyCycle = floatFromSerial;
+    }
+  }
+  else if (strcmp("f", commandFromSerial) == 0){
+      driveFreq = (floatFromSerial > 300) ? 300:floatFromSerial<0.1 ? 0.1:floatFromSerial;
+  }
+  else if (strcmp("c", commandFromSerial) == 0){
+    if(integerFromSerial >= 123 && integerFromSerial <= 15000){
+      setCarrierFreq(integerFromSerial);
+    }
+  }
 
   uint8_t pwmState = PINB & (1<<PB7);
   if (pwmState != 0 && pwmState != prevpwmState){
@@ -153,16 +185,16 @@ void loop() {
   }
 
   // Filter current knob position
-  freqKnobFilter.Filter(analogRead(FREQKNOB));
-  driveFreq = ((float)map(freqKnobFilter.Current(),1,1020,1,100));
+  //freqKnobFilter.Filter(analogRead(FREQKNOB));
+  //driveFreq = ((float)map(freqKnobFilter.Current(),1,1020,1,100));
   
-  uint8_t carrierFreqState = map(analogRead(A1),1,1010,0,10);
+  // uint8_t carrierFreqState = map(analogRead(A1),1,1010,0,10);
 
-  if (carrierFreqState != prevCarrierFreqState){
-    setCarrierFreq(n1000Sound[carrierFreqState]);
-  }
+  // if (carrierFreqState != prevCarrierFreqState){
+  //   setCarrierFreq(n1000Sound[carrierFreqState]);
+  // }
 
-  prevCarrierFreqState = carrierFreqState;
+  // prevCarrierFreqState = carrierFreqState;
 
   prevpwmState = pwmState;
 
@@ -179,7 +211,7 @@ ISR(TIMER3_OVF_vect){
   float constant = scaleFactor*(dutyCycle/100.0);
 
   // Deterimine U phase sin LUT index
-  uint16_t uPhaseTableIndex = ((float)sineIndex*sineStep);
+  uPhaseTableIndex = ((float)sineIndex*sineStep);
   // Look up primary sine function value for u phase's duty cycle
   uint16_t uPhaseSin = ((float)sinTable[uPhaseTableIndex]*constant);
 
@@ -196,8 +228,14 @@ ISR(TIMER3_OVF_vect){
 
     // Timer 3 compare registers set high side duty cycle for each phase
     OCR3A = (uPhaseSin < deadTimeCycles) ? 0:uPhaseSin;
-    OCR3B = (vPhaseSin < deadTimeCycles) ? 0:vPhaseSin;
-    OCR3C = (wPhaseSin < deadTimeCycles) ? 0:wPhaseSin;
+    if (!dir3Ph){
+      OCR3B = (vPhaseSin < deadTimeCycles) ? 0:vPhaseSin;
+      OCR3C = (wPhaseSin < deadTimeCycles) ? 0:wPhaseSin;
+    }
+    else{
+      OCR3C = (vPhaseSin < deadTimeCycles) ? 0:vPhaseSin;
+      OCR3B = (wPhaseSin < deadTimeCycles) ? 0:wPhaseSin;
+    }
 
     // Timer 4 compare registers set low side duty cycle for each pulse with deadtime compensation
     OCR4A = (ICR3-OCR3A < deadTimeCycles) ? ICR3:(OCR3A + deadTimeCycles);
@@ -225,11 +263,14 @@ ISR(TIMER3_OVF_vect){
 
   if (driveFreq != prevDriveFreq){
     // Calculate number of required ISR cycles to produce 1 period of wave
-    nISR = (CPUCLOCK/(2*ICR3))/driveFreq;
+    nISR = (CPUCLOCK/(2*(long)ICR3))/driveFreq;
     // Calculate sine table step size
     sineStep = ((float)nSine/(float)nISR);
     // Calculate nearest ISR sine index
-    sineIndex = ((float)uPhaseTableIndex/sineStep);
+    sineIndex = ((float)uPhaseTableIndex/sineStep)+1;
+    // Calculate duty cycle based on V/F ratio
+    float dutyCycleCalc = (vfRatio*driveFreq/vRMS_DCBUS)*100;
+    dutyCycle = (dutyCycleCalc < 10) ? 50:(dutyCycleCalc > 100 ? 100:dutyCycleCalc);
   }
   prevDriveFreq = driveFreq;
 
@@ -246,9 +287,11 @@ void setupPins(){
   // Ext sync pin for oscilloscope
   pinMode(12, OUTPUT);
 
+  // Ext enable pin
   pinMode(13, INPUT_PULLUP);
 
-  pinMode(22, OUTPUT);
+  // Gate driver enable pin
+  pinMode(GATEENPIN, OUTPUT);
 
   // Configure timer pins as outputs for inverter
 
@@ -322,43 +365,34 @@ void setupTimers(uint16_t fCarrier){
 }
 
 void setCarrierFreq(uint16_t fCarrier){
-  
-  carrierFreq = fCarrier;
-
-  // Disable interrupts temporarily to prevent possible timer glitches or TOP value corruption
-  // cli();
+  // Disable interrupts to prevent glitches
+  cli();
 
   // Calculate TOP value to set for given carrier frequency (defines wave period)
-  uint16_t TOP = CPUCLOCK/(2*fCarrier); // Equation from section 17.9.5 of atmega2560 datasheet
+  ICR3 = CPUCLOCK/(2*fCarrier); // Equation from section 17.9.5 of atmega2560 datasheet
 
   // Set all TOP values for each timer (overflow value, defines frequency, ICRn defines this in Mode 8)
-  ICR3 = TOP;
-  ICR4 = TOP;
-
-  Serial.print("Top value set to: ");
-  Serial.println(TOP);
-
-  // Calculate appropriate number of deadtime cycles to create the right deadtime in microseconds
-  deadTimeCycles = (deadTimeNanos<100 ? 100:deadTimeNanos)*(16.0/1000.0);
-
-  Serial.print("Deadtime in Cycles:");
-  Serial.println(deadTimeCycles);
-
-  // Serial.print("Deadtime value set to: ");
-  // Serial.println(deadTimeCycles);
+  ICR4 = ICR3;
 
   // Sine table max value does not match the max value of TOP - scaleFactor defines this value 
-  scaleFactor = (float)TOP/(float)sinTableMax; // Calculate scaling factor for sine table
+  scaleFactor = (float)ICR3/(float)sinTableMax; // Calculate scaling factor for sine table
 
-  // Serial.print("Scale factor set to:");
-  // Serial.println(scaleFactor);
+  // Calculate number of required ISR cycles to produce 1 period of wave
+  nISR = (CPUCLOCK/(2*(long)ICR3))/driveFreq;
 
-  // Enable interrupts
-  // sei();
+  // Calculate sine table step size
+  sineStep = ((float)nSine/(float)nISR);
+
+  // Calculate nearest ISR sine index
+  sineIndex = ((float)uPhaseTableIndex/sineStep)+1;
+
+  // Enable interrupts to resume operation
+  sei();
 }
 
 void startPWM(){
-  digitalWrite(22,HIGH);
+  //
+  digitalWrite(GATEENPIN,HIGH);
   delayMicroseconds(65535);
   GTCCR = 0b10000011; // Halt and Sync All Timers
 
@@ -372,16 +406,21 @@ void startPWM(){
   TCCR3A = (1<<COM3A1)|(0<<COM3A0)|(1<<COM3B1)|(0<<COM3B0)|(1<<COM3C1)|(0<<COM3C0);
   TCCR4A = (1<<COM4A1)|(1<<COM4A0)|(1<<COM4B1)|(1<<COM4B0)|(1<<COM4C1)|(1<<COM4C0);
   Serial.println("Timer running");
+  //motorRunning = true;
 }
 
 void stopPWM(){
-  digitalWrite(22,LOW);
+  digitalWrite(GATEENPIN,LOW);
 
-  GTCCR = 0b10000011; // Halt and Sync All Timers
+  PORTH |= (1<<PH3)|(1<<PH4)|(1<<PH5);
 
   // Disable all timer outputs with compare mode output settings:
   TCCR3A = 0b00000000;
   TCCR4A = 0b00000000;
+
+  //motorRunning = false;
+
+  GTCCR = 0b10000011; // Halt and Sync All Timers
 
    // Reset output compare values for each timer (OCRnA/B)
   OCR3A = 0;

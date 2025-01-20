@@ -1,7 +1,5 @@
-#include "Filter.h"
-
-uint16_t n1000Sound[11] = {175,196,220,233,262,294,330,349,392,400,1000};
-uint16_t r160Sound[5] = {380,665,1290,1430,1245};
+// uint16_t n1000Sound[11] = {175,196,220,233,262,294,330,349,392,400,1000};  // Simulates (roughly) the Keikyu N1000 do-re-mi Siemens drive (no SHE at end)
+uint16_t r160Sound[5] = {380,665,1290,1430,1245};   // Simulates the R160A/B Alstrom drive from NYC
 
 // Auto generated sine LUT from SinCosLUTGenerator.m, credit: Alec Marshall 
 uint8_t sinTable[360] = {
@@ -53,13 +51,7 @@ uint8_t sinTable[360] = {
 125};
 
 // Maximum value in sin table
-uint8_t sinTableMax = 255;
-
-// Potentially generate new table to iterate over?
-// uint8_t sinInterpTable[369] = {0};
-
-// Create filter for analog frequency input knob to remove value bouncing
-ExponentialFilter<long> freqKnobFilter(1, 1);
+#define sinTableMax 255
 
 // Instantiate functions definitions
 void setCarrierFreq(uint16_t fCarrier);
@@ -67,38 +59,38 @@ void setupTimers(uint16_t fCarrier);
 void setupPins();
 void startPWM();
 void stopPWM();
-uint16_t map_uint16(uint16_t x, uint16_t in_min, uint16_t in_max, uint16_t out_min, uint16_t out_max);
 
 // Arduino CPU Clock (hz)
 #define CPUCLOCK 16000000
 
-// Analog input to adjust frequency
-#define FREQKNOB A0
-
 // Gate enable pin
 #define GATEENPIN 22
-
-// Default Carrier Freq
-#define DEFCARRIER 1000
 
 // Deadtime in nanoseconds between switching high and low to prevent transistor shoothrough
 // Minimum value is 100
 long deadTimeNanos = 1000;
 
-// Deadtime in timer counts (calculated in setCarrierFrequency function)
+// Deadtime in timer counts (recalculated in setCarrierFrequency function)
 uint16_t deadTimeCycles = (deadTimeNanos<100 ? 100:deadTimeNanos)*(16.0/1000.0);
 
 // Used for calculations of wave position (wavetable length)
 uint16_t nSine = sizeof(sinTable)/sizeof(sinTable[0]);
 
-// Default motor drive parameters
-float driveFreq = 10; // Drive (hz)
-float prevDriveFreq = driveFreq;
-float vfRatio = 230.0/60.0;
-float vRMS_DCBUS = 60/sqrt(2);
-float dutyCycle = (vfRatio*driveFreq/vRMS_DCBUS)*100; // (%) of max (used for voltage conversion)
-bool onePhase = false; // Switches drive between 1 and 3 phase operation
+// Initialized motor drive parameters
+float driveFreq = 0.5;  // Drive (hz)
+float prevDriveFreq = driveFreq;  // Keeps track of previous drive frequency so it is not updated unnecessarily
+float vfRatio = 230.0/60.0;       // V/f ratio set by motor parameters (change to be updatable over serial)
+float vRMS_DCBUS = 60/sqrt(2);    // Approximate RMS voltage of the DC Bus
+float dutyCycle = (vfRatio*driveFreq/vRMS_DCBUS)*100; // (%) of max DC bus voltage (used for V/f drive)
+bool onePhase = false; // Switches drive between 3 (false) and 1 (true) phase operation
 bool dir3Ph = false; // Reverses drive output
+bool motorRunning = false; // Motor state variable
+
+// Initial acceleration parameters
+float targetFreq = 0.5;  // Target freq variable;
+float kAccel = 0.1;      // Acceleration constant (freq/code execution)
+// float deltaT = 0;        // Period for ISR, dependent variable, changes with carrier freq
+uint8_t accelIndex = 0;  // Acceleration index for changing frequency updates based on carrier freq
 
 // Calculate number of required ISR cycles to produce 1 period of wave
 volatile uint16_t nISR;
@@ -111,22 +103,31 @@ volatile uint16_t sineIndex = 0;
 // Initialize U Phase table LUT index
 volatile uint16_t uPhaseTableIndex = 0;
 
-// Serial buffer size
-const byte numChars = 32;
-char receivedChars[numChars];
+// Serial control variables
+const byte numChars = 32;        // Incoming data buffer
+char receivedChars[numChars];    // Recieved characters from port
 char tempChars[numChars];        // temporary array for use when parsing
 
-// variables to hold the parsed data
-char commandFromSerial[numChars] = {0};
-int integerFromSerial = 0;
-float floatFromSerial = 0.0;
+// Variables to hold the parsed data
+char commandFromSerial[numChars] = {0}; // Char array (command)
+int integerFromSerial = 0;              // Integer recieved from serial command
+float floatFromSerial = 0.0;            // Float recieved from serial command
 
+// Keeps track of previous carrier frequency so it is not updated unnecessarily
+uint8_t carrierFreqState = 0;
+
+// Keeps track of previous carrier frequency array state (eg. n160Sound, etc...)
 uint8_t prevCarrierFreqState = 0;
 
+// 
 uint8_t prevpwmState = 0;
 
+bool prevMotorState = false;
+
 void setup() {
-  digitalWrite(22,LOW);
+  // Enable gate drivers
+  digitalWrite(GATEENPIN,LOW);
+  // Print out initial parameters
   Serial.begin(115200);
   Serial.println("Motor drive online");
   Serial.print("Sine array size: ");
@@ -136,132 +137,201 @@ void setup() {
   Serial.print("Sine stepsize: ");
   Serial.println(sineStep);
   Serial.println("Resetting, syncing, and configuring timers");
+  // Prevents duty cycle from being outside range and sets duty cycle higher if motor is commanded to low power state
+  dutyCycle = (dutyCycle < 10) ? 50:(dutyCycle > 100 ? 100:dutyCycle);
   // Sets up output and input pin configs
   setupPins();
   // Sets up timers with default carrier frequency and outputs disabled
-  setupTimers(DEFCARRIER);
+  setupTimers(r160Sound[0]);
 }
 
 void loop() {
+  // Parse serial commands
   recvSerCommand();
+  // "p" commands the power of the inverter, an integer of 1 turns it on and 0 turns it off
   if (strcmp("p", commandFromSerial) == 0){
     if(integerFromSerial == 1){
-      Serial.println("PWM started");
       startPWM();
     }
     else if(integerFromSerial == 0){
-      Serial.println("PWM stopped");
       stopPWM();
     }
   }
+  // "d" commands the direction of the output when in 3 phase mode, 1 rotates CCW, 0 rotates CW
   else if (strcmp("d", commandFromSerial) == 0){
-    if(integerFromSerial >= 1){
+    if(integerFromSerial == 1){
       dir3Ph = true;
     }
-    else{
+    else if (integerFromSerial == 0){
       dir3Ph = false;
     }
   }
+  // "v" commands the duty cycle or voltage of the motor. This is set with a floating point value between 0.1 and 100 (no integer required)
   else if (strcmp("v", commandFromSerial) == 0){
-    if(floatFromSerial >= 0.01 && floatFromSerial <= 100){
-      dutyCycle = floatFromSerial;
-    }
+    dutyCycle = (floatFromSerial > 100) ? 100:floatFromSerial<0.1 ? 0.1:floatFromSerial;
   }
+  // "f" commands a frequency setpoint. Once set, if the motor is enabled, it will accelerate until it reaches this value in open loop control.
   else if (strcmp("f", commandFromSerial) == 0){
-      driveFreq = (floatFromSerial > 300) ? 300:floatFromSerial<0.1 ? 0.1:floatFromSerial;
+      targetFreq = (floatFromSerial > 300) ? 300:floatFromSerial<0.1 ? 0.1:floatFromSerial;
   }
+  // "c" commands a carrier frequency (switching frequency) in Hz betwen 123 and 15000 hz
   else if (strcmp("c", commandFromSerial) == 0){
     if(integerFromSerial >= 123 && integerFromSerial <= 15000){
       setCarrierFreq(integerFromSerial);
     }
   }
-
-  uint8_t pwmState = PINB & (1<<PB7);
-  if (pwmState != 0 && pwmState != prevpwmState){
-    stopPWM();
+  // "a" commands a change in the acceleration constant so acceleration speed can be changed. This will eventually become a setting for hz/s
+  else if (strcmp("a", commandFromSerial) == 0){
+    kAccel = (floatFromSerial > 0.5) ? 0.5:floatFromSerial<0.001 ? 0.001:floatFromSerial;
   }
-  else if(pwmState == 0 && pwmState != prevpwmState){
+  // "ph" commands a switch in single or triple phase operation. Will only update when the motor is stopped
+  else if (strcmp("ph", commandFromSerial) == 0){
+    if(integerFromSerial == 1 && motorRunning == false){
+      onePhase = true;
+    }
+    else if(integerFromSerial == 3 && motorRunning == false){
+      onePhase = false;
+    }
+  }
+
+  // Update carrier frequency depending on current motor drive frequency (This code is specific to the R160 emulation)
+  if(driveFreq <= 5){
+    carrierFreqState = 0;
+  }
+  else if(driveFreq <= 7 && driveFreq > 5){
+    carrierFreqState = 1;
+  }
+  else if(driveFreq <= 15 && driveFreq > 7){
+    carrierFreqState = 2;
+  }
+  else if(driveFreq <= 25 && driveFreq > 15){
+    carrierFreqState = 3;
+  }
+  else if(driveFreq <= 40 && driveFreq > 25){
+    carrierFreqState = 4;
+  }
+  else if(driveFreq <= 60 && driveFreq > 40){
+    carrierFreqState = 3;
+  }
+  else if(driveFreq > 60){
+    carrierFreqState = 4;
+  }
+  if(prevCarrierFreqState != carrierFreqState){
+    setCarrierFreq(r160Sound[carrierFreqState]);
+  }
+
+
+  // Check enable switch and run correct function if state is set properly
+  uint8_t pwmState = PINB & (1<<PB7);
+
+  if(pwmState != 0 && prevpwmState != pwmState){
     startPWM();
   }
-
-  // Filter current knob position
-  //freqKnobFilter.Filter(analogRead(FREQKNOB));
-  //driveFreq = ((float)map(freqKnobFilter.Current(),1,1020,1,100));
-  
-  // uint8_t carrierFreqState = map(analogRead(A1),1,1010,0,10);
-
-  // if (carrierFreqState != prevCarrierFreqState){
-  //   setCarrierFreq(n1000Sound[carrierFreqState]);
-  // }
-
-  // prevCarrierFreqState = carrierFreqState;
+  else if (prevpwmState == pwmState){
+    stopPWM();
+  }
 
   prevpwmState = pwmState;
 
+  prevCarrierFreqState = carrierFreqState;
+
 }
 
-// void driveSPWM(float fDrive, float fCarrier, float dutyCycle){
-
-// }
-
-// Timer 1 TOP overflow ISR for updating timer CMP values
+// Timer 3 overflow ISR, responsible for generating SPWM signals
 ISR(TIMER3_OVF_vect){
 
-  // Define constant value to scale sine table by based on DC and carrier frequency
-  float constant = scaleFactor*(dutyCycle/100.0);
+  if(driveFreq > 0.1){
+    motorRunning = true;
+    // Enable all timer outputs with compare mode output settings:
+    TCCR3A = (1<<COM3A1)|(0<<COM3A0)|(1<<COM3B1)|(0<<COM3B0)|(1<<COM3C1)|(0<<COM3C0);
+    TCCR4A = (1<<COM4A1)|(1<<COM4A0)|(1<<COM4B1)|(1<<COM4B0)|(1<<COM4C1)|(1<<COM4C0);
 
-  // Deterimine U phase sin LUT index
-  uPhaseTableIndex = ((float)sineIndex*sineStep);
-  // Look up primary sine function value for u phase's duty cycle
-  uint16_t uPhaseSin = ((float)sinTable[uPhaseTableIndex]*constant);
+    // Define constant value to scale sine table by based on DC and carrier frequency
+    float constant = scaleFactor*(dutyCycle/100.0);
 
-  if(onePhase == false){
+    // Deterimine U phase sin LUT index
+    uPhaseTableIndex = ((float)sineIndex*sineStep);
+    // Look up primary sine function value for u phase's duty cycle
+    uint16_t uPhaseSin = ((float)sinTable[uPhaseTableIndex]*constant);
 
-    // V phase is offset by 120 degrees from U Phase, wrap around if too large
-    uint16_t vPhaseTableIndex = (uPhaseTableIndex < 240) ? (uPhaseTableIndex + 120):(uPhaseTableIndex - 240);
-    // W phase is offset by 120 degrees from V Phase, wrap around if too large
-    uint16_t wPhaseTableIndex = (vPhaseTableIndex < 240) ? (vPhaseTableIndex + 120):(vPhaseTableIndex - 240);
+    if(onePhase == false){
 
-    // Look up remaining sine function values for V and W phases' duty cycle
-    uint16_t vPhaseSin = ((float)sinTable[vPhaseTableIndex]*constant);
-    uint16_t wPhaseSin = ((float)sinTable[wPhaseTableIndex]*constant);
+      // V phase is offset by 120 degrees from U Phase, wrap around to zero if too large
+      uint16_t vPhaseTableIndex = (uPhaseTableIndex < 240) ? (uPhaseTableIndex + 120):(uPhaseTableIndex - 240);
+      // W phase is offset by 120 degrees from V Phase, wrap around if too large
+      uint16_t wPhaseTableIndex = (vPhaseTableIndex < 240) ? (vPhaseTableIndex + 120):(vPhaseTableIndex - 240);
 
-    // Timer 3 compare registers set high side duty cycle for each phase
-    OCR3A = (uPhaseSin < deadTimeCycles) ? 0:uPhaseSin;
-    if (!dir3Ph){
+      // Look up remaining sine function values for V and W phases' duty cycle
+      uint16_t vPhaseSin = ((float)sinTable[vPhaseTableIndex]*constant);
+      uint16_t wPhaseSin = ((float)sinTable[wPhaseTableIndex]*constant);
+
+      // Timer 3 compare registers set high side duty cycle for each phase
+      OCR3A = (uPhaseSin < deadTimeCycles) ? 0:uPhaseSin;
+      // Serial.println(OCR3A);
+      
+      // Flip U and V phases to reverse motor in 3-phase mode, low side timers will correctly update without flipping
+      if (!dir3Ph){
+        OCR3B = (vPhaseSin < deadTimeCycles) ? 0:vPhaseSin;
+        OCR3C = (wPhaseSin < deadTimeCycles) ? 0:wPhaseSin;
+      }
+      else{
+        OCR3C = (vPhaseSin < deadTimeCycles) ? 0:vPhaseSin;
+        OCR3B = (wPhaseSin < deadTimeCycles) ? 0:wPhaseSin;
+      }
+
+      // Timer 4 compare registers set low side duty cycle for each pulse with deadtime compensation
+      OCR4A = (ICR3-OCR3A < deadTimeCycles) ? ICR3:(OCR3A + deadTimeCycles);
+      OCR4B = (ICR3-OCR3B < deadTimeCycles) ? ICR3:(OCR3B + deadTimeCycles);
+      OCR4C = (ICR3-OCR3C < deadTimeCycles) ? ICR3:(OCR3C + deadTimeCycles);
+
+    }
+
+    else if(onePhase == true){
+
+      // V phase is offset by 180 degrees from U Phase, wrap around if too large
+      uint16_t vPhaseTableIndex = (uPhaseTableIndex < 180) ? (uPhaseTableIndex + 180):(uPhaseTableIndex - 180);
+      
+      // Look up remaining sine function value for V phase's duty cycle
+      uint16_t vPhaseSin = ((float)sinTable[vPhaseTableIndex]*constant);
+
+      OCR3A = (uPhaseSin < deadTimeCycles) ? 0:uPhaseSin;
       OCR3B = (vPhaseSin < deadTimeCycles) ? 0:vPhaseSin;
-      OCR3C = (wPhaseSin < deadTimeCycles) ? 0:wPhaseSin;
-    }
-    else{
-      OCR3C = (vPhaseSin < deadTimeCycles) ? 0:vPhaseSin;
-      OCR3B = (wPhaseSin < deadTimeCycles) ? 0:wPhaseSin;
-    }
+      OCR3C = 0;
 
-    // Timer 4 compare registers set low side duty cycle for each pulse with deadtime compensation
-    OCR4A = (ICR3-OCR3A < deadTimeCycles) ? ICR3:(OCR3A + deadTimeCycles);
-    OCR4B = (ICR3-OCR3B < deadTimeCycles) ? ICR3:(OCR3B + deadTimeCycles);
-    OCR4C = (ICR3-OCR3C < deadTimeCycles) ? ICR3:(OCR3C + deadTimeCycles);
+      OCR4A = (ICR3-OCR3A < deadTimeCycles) ? ICR3:(OCR3A + deadTimeCycles);
+      OCR4B = (ICR3-OCR3B < deadTimeCycles) ? ICR3:(OCR3B + deadTimeCycles);
+      OCR4C = 0;
+    }
+  }
+  else{
+    motorRunning = false;
+    TCCR3A = 0b00000000;
+    TCCR4A = 0b00000000;
 
+    PORTH |= (1<<PH3)|(1<<PH4)|(1<<PH5);
   }
 
-  else if(onePhase == true){
+  float deltaF = targetFreq - driveFreq;
 
-    // V phase is offset by 180 degrees from U Phase, wrap around if too large
-    uint16_t vPhaseTableIndex = (uPhaseTableIndex < 180) ? (uPhaseTableIndex + 180):(uPhaseTableIndex - 180);
-    
-    // Look up remaining sine function value for V phase's duty cycle
-    uint16_t vPhaseSin = ((float)sinTable[vPhaseTableIndex]*constant);
-
-    OCR3A = (uPhaseSin < deadTimeCycles) ? 0:uPhaseSin;
-    OCR3B = (vPhaseSin < deadTimeCycles) ? 0:vPhaseSin;
-    OCR3C = 0;
-
-    OCR4A = (ICR3-OCR3A < deadTimeCycles) ? ICR3:(OCR3A + deadTimeCycles);
-    OCR4B = (ICR3-OCR3B < deadTimeCycles) ? ICR3:(OCR3B + deadTimeCycles);
-    OCR4C = 0;
+  if (accelIndex >= 10){
+  accelIndex = 0;
+  if(abs(deltaF) <= 0.1){
+    driveFreq = targetFreq;
   }
+  else if (targetFreq > driveFreq){
+    driveFreq += kAccel;
+  }
+  else if (targetFreq < driveFreq){
+    driveFreq -= kAccel;
+  }
+  }
+  else{
+    accelIndex ++;
+  }
+
 
   if (driveFreq != prevDriveFreq){
+    //Serial.println(driveFreq);
     // Calculate number of required ISR cycles to produce 1 period of wave
     nISR = (CPUCLOCK/(2*(long)ICR3))/driveFreq;
     // Calculate sine table step size
@@ -281,8 +351,10 @@ ISR(TIMER3_OVF_vect){
     // Generate temporary trigger signal
     PORTB ^= (1<<PB6);
   }
+
 }
 
+// Only needs to be called once at boot, sets up all timer and external IO pins
 void setupPins(){
   // Ext sync pin for oscilloscope
   pinMode(12, OUTPUT);
@@ -311,6 +383,7 @@ void setupPins(){
     Serial.println("Set timer pins as outputs");
 }
 
+// Only needs to be called once at boot, sets up ISR operation and PWM generation
 void setupTimers(uint16_t fCarrier){
   // Disable interrupts
   cli();
@@ -346,7 +419,7 @@ void setupTimers(uint16_t fCarrier){
 
   Serial.println("Timer settings configured");
 
-  // Reset output compare values for each timer (OCRnA/B)
+  // Reset output compare values for each timer (OCRnA/B/C)
   OCR3A = 0;
   OCR3B = 0;
   OCR3C = 0;
@@ -386,14 +459,21 @@ void setCarrierFreq(uint16_t fCarrier){
   // Calculate nearest ISR sine index
   sineIndex = ((float)uPhaseTableIndex/sineStep)+1;
 
+  // // Calculate ISR period (time constant):
+  // deltaT = 1/fCarrier;
+
   // Enable interrupts to resume operation
   sei();
 }
 
 void startPWM(){
-  //
+  Serial.println("PWM started");
+  // Turn on gates
   digitalWrite(GATEENPIN,HIGH);
+
+  // Small delay to let gates turn on
   delayMicroseconds(65535);
+
   GTCCR = 0b10000011; // Halt and Sync All Timers
 
   // Reset all relevant timer count values
@@ -405,20 +485,26 @@ void startPWM(){
   // Enable all timer outputs with compare mode output settings:
   TCCR3A = (1<<COM3A1)|(0<<COM3A0)|(1<<COM3B1)|(0<<COM3B0)|(1<<COM3C1)|(0<<COM3C0);
   TCCR4A = (1<<COM4A1)|(1<<COM4A0)|(1<<COM4B1)|(1<<COM4B0)|(1<<COM4C1)|(1<<COM4C0);
-  Serial.println("Timer running");
-  //motorRunning = true;
+
+  motorRunning = true;
 }
 
 void stopPWM(){
+  cli();
+
+  Serial.println("PWM stopped");
+
   digitalWrite(GATEENPIN,LOW);
 
-  PORTH |= (1<<PH3)|(1<<PH4)|(1<<PH5);
+  // Reset drive frequency to default
+
+  driveFreq = 0.5;
 
   // Disable all timer outputs with compare mode output settings:
   TCCR3A = 0b00000000;
   TCCR4A = 0b00000000;
 
-  //motorRunning = false;
+  motorRunning = false;
 
   GTCCR = 0b10000011; // Halt and Sync All Timers
 
@@ -434,4 +520,6 @@ void stopPWM(){
   // Reset all relevant timer count values
   TCNT3 = 0;
   TCNT4 = 0;
+
+  sei();
 }
